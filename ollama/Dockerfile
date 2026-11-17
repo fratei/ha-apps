@@ -1,7 +1,10 @@
-# Ollama's official image, pinned. The weekly update workflow raises this pin
-# after a test build of the new release.
+# Ollama's official image, pinned by version and by the digest of its
+# multi-arch index. Docker builds from the digest and ignores the tag, so every
+# host gets exactly the image CI tested, even if the tag is pushed again. The
+# weekly update workflow moves both pins after a test build at the new digest.
 ARG OLLAMA_VERSION=0.40.16
-FROM ollama/ollama:${OLLAMA_VERSION}
+ARG OLLAMA_DIGEST=sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+FROM ollama/ollama:${OLLAMA_VERSION}@${OLLAMA_DIGEST}
 
 ARG BUILD_VERSION
 ARG BUILD_ARCH

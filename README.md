@@ -23,7 +23,9 @@ Apps need Home Assistant OS.
 
 ## Updates
 
-A weekly GitHub Actions job looks for a new stable Ollama release. It test-builds the release for amd64 and aarch64, then raises the pinned version and the app version, and Home Assistant offers the update.
+A weekly GitHub Actions job looks for a new stable Ollama release. It reads the digest of the release's image once, test-builds that image for amd64 and aarch64, then pins the new version and that digest and raises the app version. Home Assistant then offers the update.
+
+Ollama's image is pinned by digest, so your host builds exactly the image that was tested. A tag that is pushed again later can't change it.
 
 ## License
 

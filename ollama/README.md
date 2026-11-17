@@ -2,7 +2,7 @@
 
 Run AI models on your Home Assistant host with [Ollama](https://ollama.com), for Home Assistant's built-in Ollama integration: AI tasks and conversation agents, without the cloud.
 
-- Built on your host from Ollama's official image, at a pinned version that is test-built before every update.
+- Built on your host from Ollama's official image, pinned by version and digest, so your host builds exactly the image that was tested.
 - Ollama's cloud models and web search are turned off.
 - Reachable only on Home Assistant's internal network: it opens no port on your LAN.
 - Sees only its own data folder, with no access to your Home Assistant configuration or API.

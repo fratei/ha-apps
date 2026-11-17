@@ -1,8 +1,10 @@
 name: Update Ollama
 
-# Once a week, look for a new stable Ollama release. If there is one, test-build
-# it for both architectures, then raise the pinned version, the app version and
-# the changelog on main. Home Assistant then offers the update.
+# Once a week, look for a new stable Ollama release. If there is one, read the
+# digest of its multi-arch image once, test-build that image for both
+# architectures, then pin the new version and that same digest, and raise the
+# app version and the changelog on main. Home Assistant then offers the update.
+# A tag that is pushed again later can't change what hosts build.
 
 on:
   schedule:
@@ -27,6 +29,7 @@ jobs:
     outputs:
       current: ${{ steps.check.outputs.current }}
       latest: ${{ steps.check.outputs.latest }}
+      digest: ${{ steps.check.outputs.digest }}
       update: ${{ steps.check.outputs.update }}
     steps:
       - name: Check out
@@ -40,6 +43,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           current=$(sed -n 's/^ARG OLLAMA_VERSION=//p' ollama/Dockerfile)
+          pinned_digest=$(sed -n 's/^ARG OLLAMA_DIGEST=//p' ollama/Dockerfile)
           # The latest release is never a draft or a prerelease.
           latest=$(gh api repos/ollama/ollama/releases/latest --jq .tag_name)
           latest=${latest#v}
@@ -49,37 +53,59 @@ jobs:
               exit 1
             fi
           done
+          if [[ ! "$pinned_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected pinned digest: '$pinned_digest'"
+            exit 1
+          fi
+
+          # Hosts keep building from the pinned digest, but a tag pushed again
+          # is worth a look.
+          if tagged=$(docker buildx imagetools inspect "ollama/ollama:$current" --format '{{json .Manifest}}' | jq -r .digest) \
+            && [ "$tagged" != "$pinned_digest" ]; then
+            echo "::warning::ollama/ollama:$current now points to $tagged, not the pinned $pinned_digest. The app still builds from the pinned digest."
+          fi
 
           update=false
+          digest=
           newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)
           if [ "$latest" != "$current" ] && [ "$newest" = "$latest" ]; then
             update=true
-            # Both architectures must be on Docker Hub before the pin moves.
-            if ! manifest=$(docker buildx imagetools inspect --raw "ollama/ollama:$latest"); then
+            # The digest is read once: the test build and the new pin both use
+            # it. Both architectures must be on Docker Hub before the pin moves.
+            if ! index=$(docker buildx imagetools inspect "ollama/ollama:$latest" --format '{{json .Manifest}}'); then
               echo "::notice::ollama/ollama:$latest isn't on Docker Hub yet. The next run tries again."
               update=false
             else
+              digest=$(jq -r .digest <<<"$index")
+              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "::error::Unexpected digest for ollama/ollama:$latest: '$digest'"
+                exit 1
+              fi
               for arch in amd64 arm64; do
                 if ! jq -e --arg arch "$arch" \
                   'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == $arch)' \
-                  <<<"$manifest" > /dev/null; then
+                  <<<"$index" > /dev/null; then
                   echo "::notice::ollama/ollama:$latest has no linux/$arch image yet. The next run tries again."
                   update=false
                 fi
               done
             fi
           fi
+          if [ "$update" = false ]; then
+            digest=
+          fi
 
           {
             echo "current=$current"
             echo "latest=$latest"
+            echo "digest=$digest"
             echo "update=$update"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Ollama"
             echo
-            echo "- Pinned: $current"
-            echo "- Latest stable release: $latest"
+            echo "- Pinned: $current at \`$pinned_digest\`"
+            echo "- Latest stable release: $latest${digest:+ at \`$digest\`}"
             echo "- Update: $update"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -90,6 +116,7 @@ jobs:
     uses: ./.github/workflows/build.yaml
     with:
       ollama_version: ${{ needs.check.outputs.latest }}
+      ollama_digest: ${{ needs.check.outputs.digest }}
 
   bump:
     name: Bump the versions
@@ -107,6 +134,7 @@ jobs:
         env:
           CURRENT: ${{ needs.check.outputs.current }}
           LATEST: ${{ needs.check.outputs.latest }}
+          DIGEST: ${{ needs.check.outputs.digest }}
         shell: python
         run: |
           import os
@@ -115,13 +143,26 @@ jobs:
 
           current = os.environ["CURRENT"]
           latest = os.environ["LATEST"]
+          # The digest the test build used.
+          digest = os.environ["DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit(f"Unexpected digest: {digest!r}")
 
           dockerfile = Path("ollama/Dockerfile")
           text = dockerfile.read_text()
           pin = f"ARG OLLAMA_VERSION={current}\n"
           if pin not in text:
               raise SystemExit(f"The Dockerfile no longer pins Ollama {current}")
-          dockerfile.write_text(text.replace(pin, f"ARG OLLAMA_VERSION={latest}\n", 1))
+          text = text.replace(pin, f"ARG OLLAMA_VERSION={latest}\n", 1)
+          text, count = re.subn(
+              r"^ARG OLLAMA_DIGEST=sha256:[0-9a-f]{64}$",
+              f"ARG OLLAMA_DIGEST={digest}",
+              text,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Can't find the pinned digest in ollama/Dockerfile")
+          dockerfile.write_text(text)
 
           config = Path("ollama/config.yaml")
           text = config.read_text()
@@ -150,14 +191,17 @@ jobs:
       - name: Commit and push
         env:
           LATEST: ${{ needs.check.outputs.latest }}
+          DIGEST: ${{ needs.check.outputs.digest }}
           APP: ${{ steps.bump.outputs.app }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --all --message "Update Ollama to $LATEST (app $APP)"
+          git commit --all \
+            --message "Update Ollama to $LATEST (app $APP)" \
+            --message "Pins ollama/ollama:$LATEST@$DIGEST, the image the test build used."
           git push origin HEAD:main
           {
             echo "### Updated"
             echo
-            echo "Ollama $LATEST, app version $APP."
+            echo "Ollama $LATEST at \`$DIGEST\`, app version $APP."
           } >> "$GITHUB_STEP_SUMMARY"

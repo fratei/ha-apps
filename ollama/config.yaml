@@ -6,7 +6,7 @@
 # - no Home Assistant or Supervisor API access, and no extra privileges
 # - Docker's default AppArmor profile, and an init process
 name: Ollama
-version: "1.0.0"
+version: "1.0.1"
 slug: ollama
 description: Local AI models for Home Assistant's AI tasks, with Ollama's cloud turned off
 url: https://github.com/fratei/ha-apps/tree/main/ollama

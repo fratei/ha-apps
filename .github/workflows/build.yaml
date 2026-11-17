@@ -10,10 +10,18 @@ on:
         description: Ollama version to build instead of the pinned one, for example 0.40.16
         type: string
         default: ""
+      ollama_digest:
+        description: Digest of that version's multi-arch image. Empty means the one its tag points to now.
+        type: string
+        default: ""
   workflow_call:
     inputs:
       ollama_version:
         description: Ollama version to build instead of the pinned one
+        type: string
+        default: ""
+      ollama_digest:
+        description: Digest of that version's multi-arch image
         type: string
         default: ""
 
@@ -77,38 +85,87 @@ jobs:
         id: versions
         env:
           REQUESTED: ${{ inputs.ollama_version }}
+          REQUESTED_DIGEST: ${{ inputs.ollama_digest }}
         run: |
           app=$(sed -n 's/^version: "\(.*\)"$/\1/p' ollama/config.yaml)
           pinned=$(sed -n 's/^ARG OLLAMA_VERSION=//p' ollama/Dockerfile)
-          ollama=${REQUESTED:-$pinned}
+          pinned_digest=$(sed -n 's/^ARG OLLAMA_DIGEST=//p' ollama/Dockerfile)
           if [[ ! "$app" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Can't read the app version from ollama/config.yaml"
             exit 1
+          fi
+          if [ -n "$REQUESTED_DIGEST" ] && [ -z "$REQUESTED" ]; then
+            echo "::error::A digest needs a version"
+            exit 1
+          fi
+          if [ -n "$REQUESTED" ]; then
+            override=true
+            ollama=$REQUESTED
+            digest=$REQUESTED_DIGEST
+            if [ -z "$digest" ]; then
+              digest=$(docker buildx imagetools inspect "ollama/ollama:$ollama" --format '{{json .Manifest}}' | jq -r .digest)
+            fi
+          else
+            override=false
+            ollama=$pinned
+            digest=$pinned_digest
           fi
           if [[ ! "$ollama" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
             echo "::error::Invalid Ollama version: '$ollama'"
             exit 1
           fi
-          echo "App $app, Ollama $ollama (pinned: $pinned)"
-          echo "app=$app" >> "$GITHUB_OUTPUT"
-          echo "ollama=$ollama" >> "$GITHUB_OUTPUT"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid image digest: '$digest'"
+            exit 1
+          fi
+          echo "App $app, ollama/ollama:$ollama@$digest (pinned: $pinned@$pinned_digest)"
+          {
+            echo "app=$app"
+            echo "ollama=$ollama"
+            echo "digest=$digest"
+            echo "override=$override"
+          } >> "$GITHUB_OUTPUT"
 
-      # The same build Supervisor runs on the Home Assistant host.
+      # The same build Supervisor runs on the Home Assistant host. The Ollama
+      # build args are only passed to test another version.
       - name: Build the image
         env:
           APP_VERSION: ${{ steps.versions.outputs.app }}
           OLLAMA_VERSION: ${{ steps.versions.outputs.ollama }}
+          OLLAMA_DIGEST: ${{ steps.versions.outputs.digest }}
+          OVERRIDE: ${{ steps.versions.outputs.override }}
         run: |
+          args=(--build-arg "BUILD_VERSION=$APP_VERSION" --build-arg "BUILD_ARCH=$ARCH")
+          if [ "$OVERRIDE" = true ]; then
+            args+=(--build-arg "OLLAMA_VERSION=$OLLAMA_VERSION" --build-arg "OLLAMA_DIGEST=$OLLAMA_DIGEST")
+          fi
           docker buildx build \
             --platform "$PLATFORM" \
             --pull \
             --load \
             --tag local/ollama:test \
-            --build-arg "BUILD_VERSION=$APP_VERSION" \
-            --build-arg "BUILD_ARCH=$ARCH" \
-            --build-arg "OLLAMA_VERSION=$OLLAMA_VERSION" \
+            "${args[@]}" \
             ollama
           docker image ls local/ollama:test
+
+      # The digest must be a multi-arch index with this platform, and the app's
+      # layers must be exactly that platform's layers.
+      - name: Check that the image is built from the pinned digest
+        env:
+          OLLAMA_DIGEST: ${{ steps.versions.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect "ollama/ollama@$OLLAMA_DIGEST" --format '{{json .}}' > "$RUNNER_TEMP/base.json"
+          jq '.manifest | {digest, mediaType, platforms: [.manifests[]?.platform | "\(.os)/\(.architecture)"]}' "$RUNNER_TEMP/base.json"
+          jq -e --arg digest "$OLLAMA_DIGEST" \
+            '.manifest.digest == $digest and (.manifest.mediaType | IN("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"))' \
+            "$RUNNER_TEMP/base.json"
+          docker image inspect local/ollama:test --format '{{json .RootFS.Layers}}' > "$RUNNER_TEMP/layers.json"
+          if ! jq -e --arg platform "$PLATFORM" --slurpfile app "$RUNNER_TEMP/layers.json" \
+            '(.image[$platform].rootfs.diff_ids // []) as $base | ($base | length) > 0 and $app[0][:($base | length)] == $base' \
+            "$RUNNER_TEMP/base.json"; then
+            echo "::error::The image isn't built from the $PLATFORM image of ollama/ollama@$OLLAMA_DIGEST"
+            exit 1
+          fi
 
       - name: Check the labels
         env:
