@@ -1,0 +1,163 @@
+name: Update Ollama
+
+# Once a week, look for a new stable Ollama release. If there is one, test-build
+# it for both architectures, then raise the pinned version, the app version and
+# the changelog on main. Home Assistant then offers the update.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-ollama
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Check for a new release
+    runs-on: ubuntu-24.04
+    outputs:
+      current: ${{ steps.check.outputs.current }}
+      latest: ${{ steps.check.outputs.latest }}
+      update: ${{ steps.check.outputs.update }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compare the pinned version with the latest stable release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(sed -n 's/^ARG OLLAMA_VERSION=//p' ollama/Dockerfile)
+          # The latest release is never a draft or a prerelease.
+          latest=$(gh api repos/ollama/ollama/releases/latest --jq .tag_name)
+          latest=${latest#v}
+          for version in "$current" "$latest"; do
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Unexpected version: '$version'"
+              exit 1
+            fi
+          done
+
+          update=false
+          newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)
+          if [ "$latest" != "$current" ] && [ "$newest" = "$latest" ]; then
+            update=true
+            # Both architectures must be on Docker Hub before the pin moves.
+            if ! manifest=$(docker buildx imagetools inspect --raw "ollama/ollama:$latest"); then
+              echo "::notice::ollama/ollama:$latest isn't on Docker Hub yet. The next run tries again."
+              update=false
+            else
+              for arch in amd64 arm64; do
+                if ! jq -e --arg arch "$arch" \
+                  'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == $arch)' \
+                  <<<"$manifest" > /dev/null; then
+                  echo "::notice::ollama/ollama:$latest has no linux/$arch image yet. The next run tries again."
+                  update=false
+                fi
+              done
+            fi
+          fi
+
+          {
+            echo "current=$current"
+            echo "latest=$latest"
+            echo "update=$update"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Ollama"
+            echo
+            echo "- Pinned: $current"
+            echo "- Latest stable release: $latest"
+            echo "- Update: $update"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Test build
+    needs: check
+    if: needs.check.outputs.update == 'true'
+    uses: ./.github/workflows/build.yaml
+    with:
+      ollama_version: ${{ needs.check.outputs.latest }}
+
+  bump:
+    name: Bump the versions
+    needs: [check, build]
+    if: needs.check.outputs.update == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Update the Dockerfile, the app version and the changelog
+        id: bump
+        env:
+          CURRENT: ${{ needs.check.outputs.current }}
+          LATEST: ${{ needs.check.outputs.latest }}
+        shell: python
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          current = os.environ["CURRENT"]
+          latest = os.environ["LATEST"]
+
+          dockerfile = Path("ollama/Dockerfile")
+          text = dockerfile.read_text()
+          pin = f"ARG OLLAMA_VERSION={current}\n"
+          if pin not in text:
+              raise SystemExit(f"The Dockerfile no longer pins Ollama {current}")
+          dockerfile.write_text(text.replace(pin, f"ARG OLLAMA_VERSION={latest}\n", 1))
+
+          config = Path("ollama/config.yaml")
+          text = config.read_text()
+          match = re.search(r'^version: "(\d+)\.(\d+)\.(\d+)"$', text, re.MULTILINE)
+          if not match:
+              raise SystemExit("Can't find the app version in ollama/config.yaml")
+          major, minor, patch = (int(part) for part in match.groups())
+          app = f"{major}.{minor}.{patch + 1}"
+          config.write_text(f'{text[:match.start()]}version: "{app}"{text[match.end():]}')
+
+          changelog = Path("ollama/CHANGELOG.md")
+          text = changelog.read_text()
+          heading = "# Changelog\n\n"
+          if not text.startswith(heading):
+              raise SystemExit("ollama/CHANGELOG.md doesn't start with '# Changelog'")
+          entry = (
+              f"## {app}\n\n"
+              f"- Update Ollama to {latest} "
+              f"([release notes](https://github.com/ollama/ollama/releases/tag/v{latest})).\n\n"
+          )
+          changelog.write_text(heading + entry + text[len(heading):])
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"app={app}\n")
+
+      - name: Commit and push
+        env:
+          LATEST: ${{ needs.check.outputs.latest }}
+          APP: ${{ steps.bump.outputs.app }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --all --message "Update Ollama to $LATEST (app $APP)"
+          git push origin HEAD:main
+          {
+            echo "### Updated"
+            echo
+            echo "Ollama $LATEST, app version $APP."
+          } >> "$GITHUB_STEP_SUMMARY"

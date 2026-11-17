@@ -1,0 +1,18 @@
+# The secure defaults are left out on purpose, because the app linter rejects
+# keys set to their default value. So this app has:
+# - no host ports, no ingress and no host network: Home Assistant reaches it on
+#   the internal network only
+# - no folder mappings: it sees only its own /data folder
+# - no Home Assistant or Supervisor API access, and no extra privileges
+# - Docker's default AppArmor profile, and an init process
+name: Ollama
+version: "1.0.0"
+slug: ollama
+description: Local AI models for Home Assistant's AI tasks, with Ollama's cloud turned off
+url: https://github.com/fratei/ha-apps/tree/main/ollama
+arch:
+  - aarch64
+  - amd64
+backup_exclude:
+  - models
+  - models/**

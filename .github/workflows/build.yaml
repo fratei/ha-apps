@@ -1,0 +1,252 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ollama_version:
+        description: Ollama version to build instead of the pinned one, for example 0.40.16
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ollama_version:
+        description: Ollama version to build instead of the pinned one
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run the Home Assistant app linter
+        uses: frenck/action-app-linter@v2
+        with:
+          path: ./ollama
+
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
+      API: http://127.0.0.1:11434
+      TEST_MODEL: smollm2:135m
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Ollama's image is several GB, so make room on the runner first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          df -h /
+
+      - name: Read the versions
+        id: versions
+        env:
+          REQUESTED: ${{ inputs.ollama_version }}
+        run: |
+          app=$(sed -n 's/^version: "\(.*\)"$/\1/p' ollama/config.yaml)
+          pinned=$(sed -n 's/^ARG OLLAMA_VERSION=//p' ollama/Dockerfile)
+          ollama=${REQUESTED:-$pinned}
+          if [[ ! "$app" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Can't read the app version from ollama/config.yaml"
+            exit 1
+          fi
+          if [[ ! "$ollama" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "::error::Invalid Ollama version: '$ollama'"
+            exit 1
+          fi
+          echo "App $app, Ollama $ollama (pinned: $pinned)"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "ollama=$ollama" >> "$GITHUB_OUTPUT"
+
+      # The same build Supervisor runs on the Home Assistant host.
+      - name: Build the image
+        env:
+          APP_VERSION: ${{ steps.versions.outputs.app }}
+          OLLAMA_VERSION: ${{ steps.versions.outputs.ollama }}
+        run: |
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --pull \
+            --load \
+            --tag local/ollama:test \
+            --build-arg "BUILD_VERSION=$APP_VERSION" \
+            --build-arg "BUILD_ARCH=$ARCH" \
+            --build-arg "OLLAMA_VERSION=$OLLAMA_VERSION" \
+            ollama
+          docker image ls local/ollama:test
+
+      - name: Check the labels
+        env:
+          APP_VERSION: ${{ steps.versions.outputs.app }}
+        run: |
+          labels=$(docker image inspect local/ollama:test --format '{{json .Config.Labels}}')
+          jq . <<<"$labels"
+          jq -e --arg arch "$ARCH" --arg version "$APP_VERSION" \
+            '."io.hass.type" == "app" and ."io.hass.arch" == $arch and ."io.hass.version" == $version' \
+            <<<"$labels"
+
+      - name: Start the app
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          docker run --detach --name ollama --init \
+            --publish 127.0.0.1:11434:11434 \
+            --volume "$RUNNER_TEMP/data:/data" \
+            local/ollama:test
+          for _ in $(seq 60); do
+            if curl -fs "$API/api/version"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The server didn't start"
+          exit 1
+
+      - name: Check the Ollama version
+        env:
+          OLLAMA_VERSION: ${{ steps.versions.outputs.ollama }}
+        run: |
+          version=$(curl -fsS "$API/api/version" | jq -r .version)
+          echo "Ollama $version"
+          test "$version" = "$OLLAMA_VERSION"
+
+      - name: Check that Ollama's cloud is off
+        run: |
+          curl -fsS "$API/api/status" | tee "$RUNNER_TEMP/status.json" | jq .
+          jq -e '.cloud.disabled == true' "$RUNNER_TEMP/status.json"
+
+          # A cloud model must be refused rather than forwarded to ollama.com.
+          code=$(curl -sS -o "$RUNNER_TEMP/cloud.json" -w '%{http_code}' "$API/api/chat" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"gpt-oss:120b-cloud","messages":[{"role":"user","content":"Hello"}],"stream":false}')
+          echo "HTTP $code: $(cat "$RUNNER_TEMP/cloud.json")"
+          test "$code" = 403
+          grep -F 'ollama cloud is disabled' "$RUNNER_TEMP/cloud.json"
+
+          docker logs ollama > "$RUNNER_TEMP/ollama.log" 2>&1
+          grep -F 'Ollama cloud disabled: true' "$RUNNER_TEMP/ollama.log"
+
+      - name: Check the server settings
+        run: |
+          docker logs ollama > "$RUNNER_TEMP/ollama.log" 2>&1
+          config=$(grep -m1 -F 'msg="server config"' "$RUNNER_TEMP/ollama.log")
+          echo "$config"
+          failed=0
+          for setting in \
+            OLLAMA_HOST:http://0.0.0.0:11434 \
+            OLLAMA_MODELS:/data/models \
+            OLLAMA_NO_CLOUD:true \
+            OLLAMA_KEEP_ALIVE:5m0s \
+            OLLAMA_MAX_LOADED_MODELS:1 \
+            OLLAMA_NUM_PARALLEL:1 \
+            OLLAMA_DEBUG:INFO \
+            OLLAMA_DEBUG_LOG_REQUESTS:false; do
+            if [[ "$config" != *"[$setting "* && "$config" != *" $setting "* && "$config" != *" $setting]"* ]]; then
+              echo "::error::The server config doesn't have $setting"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Wait for the health check
+        run: |
+          for _ in $(seq 30); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' ollama)
+            echo "Health: $health"
+            if [ "$health" = healthy ]; then
+              exit 0
+            fi
+            if [ "$health" = unhealthy ]; then
+              break
+            fi
+            sleep 5
+          done
+          docker inspect --format '{{json .State.Health}}' ollama | jq .
+          exit 1
+
+      - name: Download a small model from Ollama's library and run it
+        run: |
+          for attempt in 1 2 3; do
+            if jq -n --arg model "$TEST_MODEL" '{model: $model, stream: false}' \
+              | curl -fsS "$API/api/pull" -d @-; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep 15
+          done
+          echo
+          jq -n --arg model "$TEST_MODEL" \
+            '{model: $model, prompt: "Say hello.", stream: false, options: {num_predict: 8, temperature: 0}}' \
+            | curl -fsS "$API/api/generate" -d @- \
+            | tee "$RUNNER_TEMP/generate.json" | jq '{response, done, total_duration}'
+          jq -e '.done == true' "$RUNNER_TEMP/generate.json"
+
+      - name: Check that the model is stored in the data folder
+        run: |
+          sudo du -sh "$RUNNER_TEMP/data/models"
+          size=$(sudo du -sm "$RUNNER_TEMP/data/models" | cut -f1)
+          (( size > 50 ))
+
+      - name: Check that the model unloads after 5 idle minutes
+        run: |
+          curl -fsS "$API/api/ps" | tee "$RUNNER_TEMP/ps.json" | jq .
+          left=$(jq '.models[0].expires_at | sub("\\.[0-9]+"; "") | fromdateiso8601 - now | floor' "$RUNNER_TEMP/ps.json")
+          echo "Unloads in $left s"
+          (( left > 240 && left <= 300 ))
+
+      - name: Check the CPU priority
+        run: |
+          docker top ollama -o pid,ni,args | tee "$RUNNER_TEMP/top.txt"
+          # The server and the model runner it started must both run at niceness 10.
+          awk 'NR > 1 && ($4 == "serve" || $4 == "runner") { n++; if ($2 != 10) bad++ }
+               END { exit !(n >= 2 && bad == 0) }' "$RUNNER_TEMP/top.txt"
+
+      - name: Check that prompts aren't logged
+        run: |
+          docker logs ollama > "$RUNNER_TEMP/ollama.log" 2>&1
+          if grep -F 'Say hello' "$RUNNER_TEMP/ollama.log"; then
+            echo "::error::The log contains a prompt"
+            exit 1
+          fi
+
+      - name: Show the app log
+        if: always()
+        run: docker logs ollama 2>&1 | tail -n 200 || true
+
+      - name: Remove the container
+        if: always()
+        run: docker rm --force ollama || true
