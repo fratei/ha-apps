@@ -267,6 +267,7 @@ jobs:
         run: |
           docker logs ollama > "$RUNNER_TEMP/ollama.log" 2>&1
           # Files the container added or changed outside /data, which is checked from the host.
+          # docker diff lists every changed file, so directories are skipped below.
           docker diff ollama | awk '$1 != "D" && $2 != "/data" && $2 !~ /^\/data\// { print $2 }' \
             | tee "$RUNNER_TEMP/changed.txt"
           failed=0
@@ -278,7 +279,7 @@ jobs:
             hits=$(
               sudo grep -rlsF -D skip -- "$marker" "$RUNNER_TEMP/data"
               if [ -s "$RUNNER_TEMP/changed.txt" ]; then
-                docker exec -i ollama xargs -r -d '\n' grep -rlsF -D skip -- "$marker" < "$RUNNER_TEMP/changed.txt"
+                docker exec -i ollama xargs -r -d '\n' grep -lsF -d skip -D skip -- "$marker" < "$RUNNER_TEMP/changed.txt"
               fi
             ) || true
             if [ -n "$hits" ]; then

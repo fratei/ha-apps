@@ -51,7 +51,7 @@ The server runs as `nice -n 10 ollama serve`, at low CPU priority, so Home Assis
 - **No cloud.** Ollama refuses cloud models (names ending in `-cloud`), web search and web fetch, with the error "ollama cloud is disabled". Downloads from Ollama's model library still work.
 - **Models stay out of backups**, which keeps backups small. After you restore a backup, open the AI task on the Ollama entry, select **Reconfigure** and save it, so Home Assistant downloads the model again.
 - **Pinned and tested.** Ollama's version is pinned. A weekly job test-builds each new stable release for both architectures before the app is updated.
-- **Logs.** Debug logging and request logging are off, and the app has no option to turn them on. The log shows one line per request, without its content.
+- **Logs.** Debug logging and request logging are off, and the app has no option to turn them on. For each request, the log shows its path, timing and token counts, but not the prompt or the reply. Prompts and replies stay in memory: the build check confirms that none reach the log or a file, including before each Ollama update.
 
 ## Choosing a model
 
